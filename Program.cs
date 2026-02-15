@@ -1,5 +1,6 @@
 ﻿using System.CommandLine;
 using System.Diagnostics;
+using System.Reflection.Metadata.Ecma335;
 using System.Text.Json;
 using GBX.NET;
 using GBX.NET.Engines.Game;
@@ -10,32 +11,72 @@ using ManiaAPI.NadeoAPI;
 Gbx.LZO = new Lzo();
 Gbx.ZLib = new ZLib();
 
-var rootCmd = new RootCommand("Example CLI");
+var rootCmd = new RootCommand("TM2020 Replay Validator");
 var shouldDownloadOpt = new Option<bool>("--download-missing-maps");
+var additionalMapsStorage = new Option<string>("--additional-maps");
 var dockerVolumeOpt = new Option<string>("--docker-volume")
 {
     DefaultValueFactory = _ => "msm_data"
 };
 var replaysFolderArg = new Argument<string>("Replays folder");
 
-rootCmd.Options.Add(shouldDownloadOpt);
 rootCmd.Options.Add(dockerVolumeOpt);
-rootCmd.Arguments.Add(replaysFolderArg);
-rootCmd.SetAction(async (parseResult, cancellationToken) =>
+rootCmd.Options.Add(additionalMapsStorage);
+
+Command validateDirCmd = new("validate-dir", "Validate all replays in directory") { };
+validateDirCmd.Options.Add(shouldDownloadOpt);
+validateDirCmd.Arguments.Add(replaysFolderArg);
+
+validateDirCmd.SetAction(async (parseResult, cancellationToken) =>
 {
-    await Execute(new Opts(
+    var report = await Execute(new ValidateFolderOpts(
         parseResult.GetValue(shouldDownloadOpt),
         Environment.GetEnvironmentVariable("NADEO_LOGIN"),
         Environment.GetEnvironmentVariable("NADEO_PASSWORD"),
         parseResult.GetRequiredValue(replaysFolderArg),
-        DockerVolume: parseResult.GetRequiredValue(dockerVolumeOpt)
+        DockerVolume: parseResult.GetRequiredValue(dockerVolumeOpt),
+        AdditionalMapsFolder: parseResult.GetValue(additionalMapsStorage)
     ), CancellationToken.None);
+
+    var serOpts = new JsonSerializerOptions();
+    serOpts.WriteIndented = true;
+    Console.WriteLine(JsonSerializer.Serialize(report, serOpts));
 });
+
+var mapIdArg = new Argument<string>("Map Id");
+Option<int> topRecordsCntOpt = new("--max-records")
+{
+    DefaultValueFactory = _ => 10
+};
+Command validateMapRecordsCmd = new("validate-map", "Validate all replays in directory") { };
+validateMapRecordsCmd.Arguments.Add(mapIdArg);
+validateMapRecordsCmd.Options.Add(topRecordsCntOpt);
+
+validateMapRecordsCmd.SetAction(async (parseResult, cancellationToken) =>
+{
+    await ExecuteMapValidate(
+        new ValidateOnlineMapOpts(
+            parseResult.GetRequiredValue(mapIdArg),
+            parseResult.GetRequiredValue(topRecordsCntOpt),
+            Environment.GetEnvironmentVariable("NADEO_LOGIN")!,
+            Environment.GetEnvironmentVariable("NADEO_PASSWORD")!,
+            parseResult.GetRequiredValue(dockerVolumeOpt)
+        ),
+        CancellationToken.None
+    );
+});
+
+rootCmd.Subcommands.Add(validateMapRecordsCmd);
+rootCmd.Subcommands.Add(validateDirCmd);
 
 return rootCmd.Parse(args).Invoke();
 
-IEnumerable<string> EnumerateFiles(string path, bool recursive)
+IEnumerable<string> EnumerateFiles(string? path, bool recursive)
 {
+    if (string.IsNullOrWhiteSpace(path))
+    {
+        yield break;
+    }
     if (File.Exists(path))
     {
         yield return path;
@@ -50,22 +91,78 @@ IEnumerable<string> EnumerateFiles(string path, bool recursive)
         yield return file;
 }
 
-async Task Execute(Opts opts, CancellationToken cancellationToken)
+async Task ExecuteMapValidate(ValidateOnlineMapOpts opts, CancellationToken cancellationToken)
+{
+    using var tmp = new TempDir();
+    
+    var nsLive = new NadeoLiveServices();
+    await nsLive.AuthorizeAsync(opts.NadeoLogin, opts.NadeoPassword, AuthorizationMethod.DedicatedServer);
+    
+    var mapInfo = await nsLive.GetMapInfoAsync(opts.MapUid);
+
+    if (mapInfo is null)
+    {
+        Console.Error.WriteLine("Map not found");
+        return;
+    }
+    
+    var leaderboard = await nsLive.GetTopLeaderboardAsync(opts.MapUid, length: opts.RecordsCnt);
+    var accounts = new Dictionary<Guid, int>();
+    foreach (var record in leaderboard.Top.Top)
+    {
+        accounts[record.AccountId] = record.Position;
+    }
+    var ns = new NadeoServices();
+    await ns.AuthorizeAsync(opts.NadeoLogin, opts.NadeoPassword, AuthorizationMethod.DedicatedServer);
+
+    var replays = new Dictionary<string, int>();
+
+    foreach (var record in await ns.GetMapRecordsAsync(accounts.Keys.AsEnumerable(), mapInfo.MapId))
+    {
+        var fPath = Path.Combine(tmp.Path, Guid.NewGuid() + ".Ghost.Gbx");
+        // replays
+        var proc = Process.Start("wget",
+            $""" "{record.Url}" -U "unbeaten-ats project; teggot@proton.me" -O {fPath} """);
+        await proc.WaitForExitAsync(cancellationToken);
+        replays[fPath] = accounts[record.AccountId];
+    }
+
+    var validationReport = await Execute(new ValidateFolderOpts(
+        true,
+        opts.NadeoLogin,
+        opts.NadeoPassword,
+        tmp.Path,
+        opts.DockerVolume,
+        null
+    ), cancellationToken);
+
+    var report = new Dictionary<int, MSMValidationResult?>();
+    foreach (var (vPath, validation) in validationReport)
+    {
+        report[replays[vPath]] = validation;
+    }
+    
+    var serOpts = new JsonSerializerOptions();
+    serOpts.WriteIndented = true;
+    Console.WriteLine(JsonSerializer.Serialize(report, serOpts));
+}
+
+async Task<Dictionary<string, MSMValidationResult>> Execute(ValidateFolderOpts opts, CancellationToken cancellationToken)
 {
     // try
     // {
     //     Process.Start("docker", "volume create msm_data");
     // } catch {}
-    // Dictionary<string, string> overrides = new();
-    // try
-    // {
-    //     var x = JsonSerializer.Deserialize<Dictionary<string, string>>(
-    //         File.ReadAllText("/tmp/ttt/replays/mappings.json"));
-    //     if (x is not null) overrides = x;
-    // }
-    // catch
-    // {
-    // }
+    Dictionary<string, string> overrides = new();
+    try
+    {
+        var x = JsonSerializer.Deserialize<Dictionary<string, string>>(
+            File.ReadAllText(Path.Combine(opts.ReplaysFolder, "/mappings.json")));
+        if (x is not null) overrides = x;
+    }
+    catch
+    {
+    }
 
     var ghosts = new Dictionary<string, string>();
     var requiredMaps = new HashSet<string>();
@@ -76,8 +173,34 @@ async Task Execute(Opts opts, CancellationToken cancellationToken)
     Directory.CreateDirectory(Path.Combine(tmp.Path, "Replays"));
     Directory.CreateDirectory(Path.Combine(tmp.Path, "Maps"));
 
-    foreach (var file in EnumerateFiles(opts.ReplaysFolder, true)
-                 .Where(x => x.EndsWith(".Replay.Gbx") || x.EndsWith(".Ghost.Gbx") || x.EndsWith(".Map.Gbx")))
+    void ProcessGhost(string file, CGameCtnGhost ghost)
+    {
+        if (ghost.Validate_ChallengeUid is null)
+        {
+            Console.Error.WriteLine($"Found ghost without mapUid inside of {file} replay");
+        }
+        else
+        {
+            var fileName = Guid.NewGuid() + ".Ghost.Gbx";
+            if (overrides.ContainsKey(fileName))
+            {
+                ghost.Validate_ChallengeUid = overrides[fileName];
+                ghost.Save(Path.Combine(tmp.Path, "Replays", fileName));
+            }
+            else
+            {
+                File.Copy(file, Path.Combine(tmp.Path, "Replays", fileName));
+            }
+
+            requiredMaps.Add(ghost.Validate_ChallengeUid);
+            ghosts[fileName] = file;
+        }
+    }
+
+    foreach (var file in
+             EnumerateFiles(opts.ReplaysFolder, true)
+                 .Where(x => x.EndsWith(".Replay.Gbx", StringComparison.OrdinalIgnoreCase) || x.EndsWith(".Ghost.Gbx", StringComparison.OrdinalIgnoreCase) || x.EndsWith(".Map.Gbx", StringComparison.OrdinalIgnoreCase))
+                 .Concat(EnumerateFiles(opts.AdditionalMapsFolder, true).Where(x => x.EndsWith(".Map.Gbx", StringComparison.OrdinalIgnoreCase))))
     {
         var node = Gbx.ParseNode(file);
         switch (node)
@@ -92,35 +215,14 @@ async Task Execute(Opts opts, CancellationToken cancellationToken)
                         break;
                     }
 
-                    if (ghost.Validate_ChallengeUid is null)
-                    {
-                        Console.Error.WriteLine($"Found ghost without mapUid inside of {file} replay");
-                    }
-                    else
-                    {
-                        requiredMaps.Add(ghost.Validate_ChallengeUid);
-                        var fileName = Guid.NewGuid() + ".Replay.Gbx";
-                        File.Copy(file, Path.Combine(tmp.Path, "Replays", fileName));
-                        ghosts[fileName] = file;
-                    }
+                    ProcessGhost(file, ghost);
                 }
 
                 break;
             }
             case CGameCtnGhost ghost:
             {
-                if (ghost.Validate_ChallengeUid is null)
-                {
-                    Console.Error.WriteLine($"Found ghost without mapUid inside of {file} replay");
-                }
-                else
-                {
-                    requiredMaps.Add(ghost.Validate_ChallengeUid);
-                    var fileName = Guid.NewGuid() + ".Replay.Gbx";
-                    File.Copy(file, Path.Combine(tmp.Path, "Replays", fileName));
-                    ghosts[fileName] = file;
-                }
-
+                ProcessGhost(file, ghost);
                 break;
             }
             case CGameCtnChallenge map:
@@ -173,7 +275,9 @@ async Task Execute(Opts opts, CancellationToken cancellationToken)
         File.Copy(mapPath, outPath);
     }
 
-    var args = string.Join(' ', "run", "--rm", "-e", "MSM_ONLY_STDOUT=True", "-e", "MSM_VALIDATE_PATH=.", "-e",
+    var args = string.Join(' ', "run",
+        "-u", "0",
+        "--rm", "-e", "MSM_ONLY_STDOUT=True", "-e", "MSM_VALIDATE_PATH=.", "-e",
         "MSM_SERVER_TYPE=TM2020", "-e", "MSM_SERVER_IDENTIFIER=MyServer", "-v", $"{opts.DockerVolume}:/app/data", "-v",
         $"\"{tmp.Path}/Replays:/app/data/servers/MyServer/UserData/Replays\"", "-v",
         $"\"{tmp.Path}/Maps:/app/data/servers/MyServer/UserData/Maps\"", "bigbang1112/mania-server-manager:alpine");
@@ -185,7 +289,7 @@ async Task Execute(Opts opts, CancellationToken cancellationToken)
             FileName = "docker",
             Arguments = args,
             RedirectStandardOutput = true,
-            RedirectStandardError = true,
+            RedirectStandardError = false,
             UseShellExecute = false,
             CreateNoWindow = true
         }
@@ -204,11 +308,8 @@ async Task Execute(Opts opts, CancellationToken cancellationToken)
 
     var report = new Dictionary<string, MSMValidationResult?>();
 
-    foreach (var ghostFname in ghosts.Keys) report[ghostFname] = results.GetValueOrDefault(ghostFname, null);
-
-    var serOpts = new JsonSerializerOptions();
-    serOpts.WriteIndented = true;
-    Console.WriteLine(JsonSerializer.Serialize(report, serOpts));
+    foreach (var ghostFname in ghosts.Keys) report[ghosts[ghostFname]] = results.GetValueOrDefault(ghostFname, null);
+    return report;
 }
 
 async Task ProcessStdoutAsync(Dictionary<string, MSMValidationResult> results, Process process,
@@ -261,10 +362,19 @@ public sealed class TempDir : IDisposable
     }
 }
 
-internal record Opts(
+internal record ValidateFolderOpts(
     bool DownloadMissingMaps,
     string? NadeoLogin,
     string? NadeoPassword,
-    string? ReplaysFolder,
+    string ReplaysFolder,
+    string DockerVolume,
+    string? AdditionalMapsFolder
+);
+
+internal record ValidateOnlineMapOpts(
+    string MapUid,
+    int RecordsCnt,
+    string NadeoLogin,
+    string NadeoPassword,
     string DockerVolume
 );
