@@ -1,6 +1,8 @@
 ﻿using System.CommandLine;
 using System.Diagnostics;
+using System.IO.Pipelines;
 using System.Reflection.Metadata.Ecma335;
+using System.Text;
 using System.Text.Json;
 using GBX.NET;
 using GBX.NET.Engines.Game;
@@ -173,7 +175,7 @@ async Task<Dictionary<string, MSMValidationResult>> Execute(ValidateFolderOpts o
     Directory.CreateDirectory(Path.Combine(tmp.Path, "Replays"));
     Directory.CreateDirectory(Path.Combine(tmp.Path, "Maps"));
 
-    void ProcessGhost(string file, CGameCtnGhost ghost)
+    void ProcessGhost(string file, CGameCtnGhost ghost, bool isGhost)
     {
         if (ghost.Validate_ChallengeUid is null)
         {
@@ -181,7 +183,7 @@ async Task<Dictionary<string, MSMValidationResult>> Execute(ValidateFolderOpts o
         }
         else
         {
-            var fileName = Guid.NewGuid() + ".Ghost.Gbx";
+            var fileName = Guid.NewGuid() + (isGhost ? ".Ghost.Gbx" : ".Replay.Gbx");
             if (overrides.ContainsKey(fileName))
             {
                 ghost.Validate_ChallengeUid = overrides[fileName];
@@ -215,14 +217,14 @@ async Task<Dictionary<string, MSMValidationResult>> Execute(ValidateFolderOpts o
                         break;
                     }
 
-                    ProcessGhost(file, ghost);
+                    ProcessGhost(file, ghost, false);
                 }
 
                 break;
             }
             case CGameCtnGhost ghost:
             {
-                ProcessGhost(file, ghost);
+                ProcessGhost(file, ghost, true);
                 break;
             }
             case CGameCtnChallenge map:
@@ -278,7 +280,8 @@ async Task<Dictionary<string, MSMValidationResult>> Execute(ValidateFolderOpts o
     var args = string.Join(' ', "run",
         "-u", "0",
         "--rm", "-e", "MSM_ONLY_STDOUT=True", "-e", "MSM_VALIDATE_PATH=.", "-e",
-        "MSM_SERVER_TYPE=TM2020", "-e", "MSM_SERVER_IDENTIFIER=MyServer", "-v", $"{opts.DockerVolume}:/app/data", "-v",
+        "MSM_SERVER_TYPE=TM2020", "-e", "\"MSM_SERVER_DOWNLOAD_HOST_TM2020=http://files.v04.maniaplanet.com/server\"",
+        "-e", "MSM_SERVER_IDENTIFIER=MyServer", "-v", $"{opts.DockerVolume}:/app/data", "-v",
         $"\"{tmp.Path}/Replays:/app/data/servers/MyServer/UserData/Replays\"", "-v",
         $"\"{tmp.Path}/Maps:/app/data/servers/MyServer/UserData/Maps\"", "bigbang1112/mania-server-manager:alpine");
 
@@ -289,7 +292,7 @@ async Task<Dictionary<string, MSMValidationResult>> Execute(ValidateFolderOpts o
             FileName = "docker",
             Arguments = args,
             RedirectStandardOutput = true,
-            RedirectStandardError = false,
+            RedirectStandardError = true,
             UseShellExecute = false,
             CreateNoWindow = true
         }
@@ -298,25 +301,78 @@ async Task<Dictionary<string, MSMValidationResult>> Execute(ValidateFolderOpts o
     process.Start();
 
     var results = new Dictionary<string, MSMValidationResult>();
+    
+    using var reader = process.StandardOutput;
+    var pipe = new System.IO.Pipelines.Pipe();
+    var writer = pipe.Writer.AsStream();
+    var readerStream = pipe.Reader.AsStream();
 
-    // var tasks = new Task[]{
-    //     process.WaitForExitAsync(cancellationToken),
-    // };
-
-    await ProcessStdoutAsync(results, process, cancellationToken);
-    await process.WaitForExitAsync(cancellationToken);
+    Task.WaitAll(new Task[]
+    {
+        FixMalformedJsonOutput(reader, writer),
+        ProcessStdoutAsync(results, readerStream, cancellationToken),
+        // DrainStdout(process, cancellationToken),
+        DrainStderr(process, cancellationToken),
+        process.WaitForExitAsync(cancellationToken)
+    });
 
     var report = new Dictionary<string, MSMValidationResult?>();
 
     foreach (var ghostFname in ghosts.Keys) report[ghosts[ghostFname]] = results.GetValueOrDefault(ghostFname, null);
     return report;
 }
+async Task DrainStdout(Process process, CancellationToken cancellationToken)
+{
+    string? line;
+    while ((line = await process.StandardOutput.ReadLineAsync(cancellationToken)) is not null)
+    {
+        Console.WriteLine(line);
+    }
+}
 
-async Task ProcessStdoutAsync(Dictionary<string, MSMValidationResult> results, Process process,
+
+async Task DrainStderr(Process process, CancellationToken cancellationToken)
+{
+    string? line;
+    while ((line = await process.StandardError.ReadLineAsync(cancellationToken)) is not null)
+    {
+        Console.Error.WriteLine(line);
+    }
+}
+
+async Task FixMalformedJsonOutput(StreamReader reader, Stream writer)
+{
+    string? prevLine = null;
+    bool firstLine = true;
+
+    while (await reader.ReadLineAsync() is { } line)
+    {
+        Console.WriteLine(line);
+        if (!firstLine)
+            await writer.WriteAsync(Encoding.UTF8.GetBytes("\n"));
+        firstLine = false;
+
+        if (prevLine is not null &&
+            prevLine.TrimEnd().EndsWith('}') &&
+            line.TrimStart().StartsWith('{'))
+        {
+            await writer.WriteAsync(Encoding.UTF8.GetBytes("," + line));
+        }
+        else
+        {
+            await writer.WriteAsync(Encoding.UTF8.GetBytes(line));
+        }
+
+        prevLine = line;
+    }
+    writer.Dispose();
+}
+
+async Task ProcessStdoutAsync(Dictionary<string, MSMValidationResult> results, Stream stdout,
     CancellationToken cancellationToken)
 {
     await foreach (var validateResult in JsonSerializer.DeserializeAsyncEnumerable<JsonElement>(
-                       process.StandardOutput.BaseStream, new JsonSerializerOptions(),
+                       stdout, new JsonSerializerOptions(),
                        cancellationToken))
     {
         var res = validateResult.Deserialize<MSMValidationResult>();
