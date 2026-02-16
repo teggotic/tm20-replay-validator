@@ -10,6 +10,7 @@ using System.Text.RegularExpressions;
 using System.Threading.Tasks.Dataflow;
 using GBX.NET;
 using GBX.NET.Engines.Game;
+using GBX.NET.Engines.MwFoundations;
 using GBX.NET.LZO;
 using GBX.NET.ZLib;
 using ManiaAPI.NadeoAPI;
@@ -314,11 +315,21 @@ async Task<Dictionary<string, MSMValidationResult>> Execute(ValidateFolderOpts o
                  .Concat(EnumerateFiles(opts.AdditionalMapsFolder, true)
                      .Where(x => x.EndsWith(".Map.Gbx", StringComparison.OrdinalIgnoreCase))))
     {
-        var node = Gbx.ParseNode(file);
+        CMwNod node;
+        try
+        {
+            node = Gbx.ParseHeaderNode(file);
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine($"{file} is cannot be parsed as gbx: {e}");
+            continue;
+        }
         switch (node)
         {
-            case CGameCtnReplayRecord replay:
+            case CGameCtnReplayRecord _:
             {
+                var replay = Gbx.ParseNode<CGameCtnReplayRecord>(file);
                 foreach (var (i, ghost) in replay.GetGhosts().Index())
                 {
                     if (i > 0)
@@ -332,8 +343,9 @@ async Task<Dictionary<string, MSMValidationResult>> Execute(ValidateFolderOpts o
 
                 break;
             }
-            case CGameCtnGhost ghost:
+            case CGameCtnGhost _:
             {
+                var ghost = Gbx.ParseNode<CGameCtnGhost>(file);
                 ProcessGhost(file, ghost, true);
                 break;
             }
