@@ -12,7 +12,6 @@ CLI tool that validates TM2020 replays by simulating inputs with the real game p
     - NADEO_LOGIN
     - NADEO_PASSWORD
 
-
 ### Prerequisites
 
 **WARNING:** This tool is still in super early development, please read through the source code to see what its doing before using it.
@@ -35,7 +34,12 @@ Global options (available to all subcommands):
     - Default: msm_data
 - --additional-maps `<path>`
     - Path to a folder with extra .Map.Gbx files to potentially reduce the number of maps to download
-    - Note: currently used by validate-dir
+- --pretty-output
+    - Pretty-print JSON output (indented) instead of compact JSON
+- --report-progress
+    - Print progress updates to stderr while processing validations
+- --verbose-stderr
+    - Print stderr output from underlying tools/processes
 
 ---
 
@@ -66,7 +70,7 @@ Global options (available to all subcommands):
     - Prints JSON report to stdout mapping leaderboard position to a validation result
 - Arguments:
     - Map Id
-        - The map UID (not the numeric MapId)
+        - The map UID (not the UUID)
 - Options:
     - --max-records `<int>`
         - How many top records to validate

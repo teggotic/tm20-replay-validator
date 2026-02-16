@@ -1,4 +1,5 @@
-﻿using System.CommandLine;
+﻿using System.Collections.Immutable;
+using System.CommandLine;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO.Pipelines;
@@ -6,6 +7,7 @@ using System.Reflection.Metadata.Ecma335;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Threading.Tasks.Dataflow;
 using GBX.NET;
 using GBX.NET.Engines.Game;
 using GBX.NET.LZO;
@@ -18,21 +20,31 @@ Gbx.ZLib = new ZLib();
 var rootCmd = new RootCommand("TM2020 Replay Validator");
 var shouldDownloadOpt = new Option<bool>("--download-missing-maps");
 var additionalMapsStorage = new Option<string>("--additional-maps");
+var prettyJsonOutputOpt = new Option<bool>("--pretty-output");
+var verboseStderrOpt = new Option<bool>("--verbose-stderr");
+var reportProgressOpt = new Option<bool>("--report-progress");
 var dockerVolumeOpt = new Option<string>("--docker-volume")
 {
     DefaultValueFactory = _ => "msm_data"
 };
 var replaysFolderArg = new Argument<string>("Replays folder");
 
-rootCmd.Options.Add(dockerVolumeOpt);
-rootCmd.Options.Add(additionalMapsStorage);
-
 Command validateDirCmd = new("validate-dir", "Validate all replays in directory") { };
 validateDirCmd.Options.Add(shouldDownloadOpt);
 validateDirCmd.Arguments.Add(replaysFolderArg);
+validateDirCmd.Options.Add(dockerVolumeOpt);
+validateDirCmd.Options.Add(additionalMapsStorage);
+validateDirCmd.Options.Add(prettyJsonOutputOpt);
+validateDirCmd.Options.Add(verboseStderrOpt);
+validateDirCmd.Options.Add(reportProgressOpt);
+
+bool VerboseStdErr;
+bool ReportProgress;
 
 validateDirCmd.SetAction(async (parseResult, cancellationToken) =>
 {
+    VerboseStdErr = parseResult.GetRequiredValue(verboseStderrOpt);
+    ReportProgress = parseResult.GetRequiredValue(reportProgressOpt);
     var report = await Execute(new ValidateFolderOpts(
         parseResult.GetValue(shouldDownloadOpt),
         Environment.GetEnvironmentVariable("NADEO_LOGIN"),
@@ -43,7 +55,7 @@ validateDirCmd.SetAction(async (parseResult, cancellationToken) =>
     ), CancellationToken.None);
 
     var serOpts = new JsonSerializerOptions();
-    serOpts.WriteIndented = true;
+    serOpts.WriteIndented = parseResult.GetRequiredValue(prettyJsonOutputOpt);
     Console.WriteLine(JsonSerializer.Serialize(report, serOpts));
 });
 
@@ -55,10 +67,16 @@ Option<int> topRecordsCntOpt = new("--max-records")
 Command validateMapRecordsCmd = new("validate-map", "Validate all replays in directory") { };
 validateMapRecordsCmd.Arguments.Add(mapIdArg);
 validateMapRecordsCmd.Options.Add(topRecordsCntOpt);
+validateMapRecordsCmd.Options.Add(dockerVolumeOpt);
+validateMapRecordsCmd.Options.Add(additionalMapsStorage);
+validateMapRecordsCmd.Options.Add(prettyJsonOutputOpt);
+validateMapRecordsCmd.Options.Add(reportProgressOpt);
 
 validateMapRecordsCmd.SetAction(async (parseResult, cancellationToken) =>
 {
-    await ExecuteMapValidate(
+    VerboseStdErr = parseResult.GetRequiredValue(verboseStderrOpt);
+    ReportProgress = parseResult.GetRequiredValue(reportProgressOpt);
+    var report = await ExecuteMapValidate(
         new ValidateOnlineMapOpts(
             parseResult.GetRequiredValue(mapIdArg),
             parseResult.GetRequiredValue(topRecordsCntOpt),
@@ -68,6 +86,10 @@ validateMapRecordsCmd.SetAction(async (parseResult, cancellationToken) =>
         ),
         CancellationToken.None
     );
+
+    var serOpts = new JsonSerializerOptions();
+    serOpts.WriteIndented = parseResult.GetRequiredValue(prettyJsonOutputOpt);
+    Console.WriteLine(JsonSerializer.Serialize(report, serOpts));
 });
 
 rootCmd.Subcommands.Add(validateMapRecordsCmd);
@@ -96,7 +118,8 @@ IEnumerable<string> EnumerateFiles(string? path, bool recursive)
         yield return file;
 }
 
-async Task ExecuteMapValidate(ValidateOnlineMapOpts opts, CancellationToken cancellationToken)
+async Task<Dictionary<int, MSMValidationResult?>> ExecuteMapValidate(ValidateOnlineMapOpts opts,
+    CancellationToken cancellationToken)
 {
     using var tmp = new TempDir();
 
@@ -107,8 +130,7 @@ async Task ExecuteMapValidate(ValidateOnlineMapOpts opts, CancellationToken canc
 
     if (mapInfo is null)
     {
-        Console.Error.WriteLine("Map not found");
-        return;
+        throw new InvalidOperationException("Map not found");
     }
 
     var leaderboard = await nsLive.GetTopLeaderboardAsync(opts.MapUid, length: opts.RecordsCnt);
@@ -126,10 +148,7 @@ async Task ExecuteMapValidate(ValidateOnlineMapOpts opts, CancellationToken canc
     foreach (var record in await ns.GetMapRecordsAsync(accounts.Keys.AsEnumerable(), mapInfo.MapId))
     {
         var fPath = Path.Combine(tmp.Path, Guid.NewGuid() + ".Ghost.Gbx");
-        // replays
-        var proc = Process.Start("wget",
-            $""" "{record.Url}" -U "unbeaten-ats project; teggot@proton.me" -O {fPath} """);
-        await proc.WaitForExitAsync(cancellationToken);
+        await DownloadFile(record.Url, fPath, cancellationToken);
         replays[fPath] = accounts[record.AccountId];
     }
 
@@ -148,9 +167,30 @@ async Task ExecuteMapValidate(ValidateOnlineMapOpts opts, CancellationToken canc
         report[replays[vPath]] = validation;
     }
 
-    var serOpts = new JsonSerializerOptions();
-    serOpts.WriteIndented = true;
-    Console.WriteLine(JsonSerializer.Serialize(report, serOpts));
+    return report;
+}
+
+async Task DownloadFile(string url, string outPath, CancellationToken cancellationToken)
+{
+    var proc = new Process()
+    {
+        StartInfo = new ProcessStartInfo
+        {
+            FileName = "wget",
+            Arguments = $""" "{url}" -U "unbeaten-ats project; teggot@proton.me" -O {outPath} """,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        }
+    };
+    proc.Start();
+
+    await Task.WhenAll(
+        proc.WaitForExitAsync(cancellationToken),
+        DrainStream(proc.StandardOutput, cancellationToken),
+        DrainStream(proc.StandardError, cancellationToken)
+    );
 }
 
 const string NadeoServerHost = "https://nadeo-download.cdn.ubi.com/trackmania";
@@ -314,26 +354,28 @@ async Task<Dictionary<string, MSMValidationResult>> Execute(ValidateFolderOpts o
 
         if (missingMaps.Count > 0)
         {
+            Directory.CreateDirectory(Path.Combine(opts.ReplaysFolder, "maps"));
             var ns = new NadeoLiveServices();
             Debug.Assert(opts.NadeoLogin is not null);
             Debug.Assert(opts.NadeoPassword is not null);
 
             await ns.AuthorizeAsync(opts.NadeoLogin, opts.NadeoPassword, AuthorizationMethod.DedicatedServer);
 
-            var maps = await ns.GetMapInfosAsync(missingMaps, cancellationToken);
-            foreach (var map in maps)
+            foreach (var mapBatch in missingMaps.Chunk(50))
             {
-                Directory.CreateDirectory(Path.Combine(opts.ReplaysFolder, "maps"));
-                var mapPath = Path.Combine(opts.ReplaysFolder, "maps", $"{map.MapId}.Map.Gbx");
-                try
+                var maps = await ns.GetMapInfosAsync(mapBatch, cancellationToken);
+                foreach (var map in maps)
                 {
-                    var proc = Process.Start("wget",
-                        $""" "https://core.trackmania.nadeo.live/maps/{map.MapId}/file" -U "unbeaten-ats project; teggot@proton.me" -O {mapPath} """);
-                    await proc.WaitForExitAsync(cancellationToken);
-                    availableMaps[map.Uid] = mapPath;
-                }
-                catch
-                {
+                    var mapPath = Path.Combine(opts.ReplaysFolder, "maps", $"{map.MapId}.Map.Gbx");
+                    try
+                    {
+                        await DownloadFile($"https://core.trackmania.nadeo.live/maps/{map.MapId}/file", mapPath,
+                            cancellationToken);
+                        availableMaps[map.Uid] = mapPath;
+                    }
+                    catch
+                    {
+                    }
                 }
             }
         }
@@ -355,6 +397,7 @@ async Task<Dictionary<string, MSMValidationResult>> Execute(ValidateFolderOpts o
 
     foreach (var group in ghosts.Values.GroupBy(x => x.Item1))
     {
+        var items = group.ToImmutableArray();
         // Console.WriteLine(group.Key);
 
         var args = string.Join(' ', "run",
@@ -393,14 +436,12 @@ async Task<Dictionary<string, MSMValidationResult>> Execute(ValidateFolderOpts o
         var writer = pipe.Writer.AsStream();
         var readerStream = pipe.Reader.AsStream();
 
-        Task.WaitAll(new Task[]
-        {
+        await Task.WhenAll(
             FixMalformedJsonOutput(reader, writer),
-            ProcessStdoutAsync(results, readerStream, cancellationToken),
-            // DrainStdout(process, cancellationToken),
-            DrainStderr(process, cancellationToken),
+            ProcessStdoutAsync(results, readerStream, items.Length, cancellationToken),
+            DrainStream(process.StandardError, cancellationToken),
             process.WaitForExitAsync(cancellationToken)
-        });
+        );
 
         foreach (var (tmpGhostName, _) in results)
         {
@@ -411,12 +452,12 @@ async Task<Dictionary<string, MSMValidationResult>> Execute(ValidateFolderOpts o
     return report;
 }
 
-async Task DrainStderr(Process process, CancellationToken cancellationToken)
+async Task DrainStream(StreamReader stream, CancellationToken cancellationToken)
 {
     string? line;
-    while ((line = await process.StandardError.ReadLineAsync(cancellationToken)) is not null)
+    while ((line = await stream.ReadLineAsync(cancellationToken)) is not null)
     {
-        // Console.Error.WriteLine(line);
+        if (VerboseStdErr) Console.Error.WriteLine(line);
     }
 }
 
@@ -449,14 +490,15 @@ async Task FixMalformedJsonOutput(StreamReader reader, Stream writer)
     writer.Dispose();
 }
 
-async Task ProcessStdoutAsync(Dictionary<string, MSMValidationResult> results, Stream stdout,
+async Task ProcessStdoutAsync(Dictionary<string, MSMValidationResult> results, Stream stdout, int total,
     CancellationToken cancellationToken)
 {
-    await foreach (var validateResult in JsonSerializer.DeserializeAsyncEnumerable<JsonElement>(
+    await foreach (var (i, validateResult) in JsonSerializer.DeserializeAsyncEnumerable<JsonElement>(
                        stdout, new JsonSerializerOptions(),
-                       cancellationToken))
+                       cancellationToken).Index())
     {
         var res = validateResult.Deserialize<MSMValidationResult>();
+        if (ReportProgress) Console.Error.WriteLine($"Got validation result ({i}/{total}): {res.FileName}");
         results[res.FileName] = res;
     }
 }
