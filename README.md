@@ -19,7 +19,7 @@ CLI tool that validates TM2020 replays by simulating inputs with the real game p
 For this tool to work, you have to create a docker volume. By default, it’s called `msm_data`, but you can use a different name and specify it with the `--docker-volume` option.
 
 ```bash
-$ docker volume create msm_data
+$ docker volume create msm_data  # this is only required to be run once
 $ tm20-replay-validator validate-map SWeykB70uNoBuM3ExlmFrEGuYRf --max-records 100
 ```
 
@@ -73,3 +73,13 @@ Global options (available to all subcommands):
         - Default: 10
 - Output:
     - JSON object: `{ <position>: <MSMValidationResult or null>, ... }`
+
+## Special thanks
+
+Huge thanks to [BigBang1112](https://github.com/BigBang1112) for all the tools they made.
+
+tm20-replay-validator heavily relies on:
+- [gbx.net](https://github.com/BigBang1112/gbx-net)
+- [mania-server-manager](https://github.com/BigBang1112/mania-server-manager)
+
+The code is heavily inspired by the [revalidate](https://github.com/BigBang1112/revalidate) project.
