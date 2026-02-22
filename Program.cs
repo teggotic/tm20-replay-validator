@@ -93,10 +93,60 @@ validateMapRecordsCmd.SetAction(async (parseResult, cancellationToken) =>
     Console.WriteLine(JsonSerializer.Serialize(report, serOpts));
 });
 
+Command extractGhostCmd = new("extract-ghost");
+Argument<string> gbxFileArg = new("gbxFile")
+{
+    Description = "Can be either ghost or replay file: \n- replay: first ghost would be extracted\n- ghost: file would be copied to output."
+};
+Argument<string> outputFileArg = new("outFile");
+
+extractGhostCmd.Arguments.Add(gbxFileArg);
+extractGhostCmd.Arguments.Add(outputFileArg);
+
+extractGhostCmd.SetAction(parseResult =>
+{
+    ExtractGhost(parseResult.GetRequiredValue(gbxFileArg), parseResult.GetRequiredValue(outputFileArg));
+});
+
 rootCmd.Subcommands.Add(validateMapRecordsCmd);
 rootCmd.Subcommands.Add(validateDirCmd);
+rootCmd.Subcommands.Add(extractGhostCmd);
 
 return rootCmd.Parse(args).Invoke();
+
+void ExtractGhost(string input, string output)
+{
+    var node = Gbx.ParseHeaderNode(input);
+    switch (node)
+    {
+        case CGameCtnReplayRecord _:
+        {
+            var replay = Gbx.ParseNode<CGameCtnReplayRecord>(input);
+            foreach (var (i, ghost) in replay.GetGhosts().Index())
+            {
+                if (i > 0)
+                {
+                    Console.Error.WriteLine($"Replay ${input} has more then one ghost. Ignoring");
+                    break;
+                }
+
+                ghost.Save(output);
+            }
+            break;
+        }
+        case CGameCtnGhost _:
+        {
+            var ghost = Gbx.ParseNode<CGameCtnGhost>(input);
+            ghost.Save(output);
+            break;
+        }
+        default:
+        {
+            Environment.Exit(1);
+            break;
+        }
+    }
+}
 
 IEnumerable<string> EnumerateFiles(string? path, bool recursive)
 {
@@ -262,12 +312,12 @@ async Task<Dictionary<string, MSMValidationResult>> Execute(ValidateFolderOpts o
     Dictionary<string, string> overrides = new();
     try
     {
-        var x = JsonSerializer.Deserialize<Dictionary<string, string>>(
-            File.ReadAllText(Path.Combine(opts.ReplaysFolder, "/mappings.json")));
+        var x = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(Path.Combine(opts.ReplaysFolder, "mappings.json")));
         if (x is not null) overrides = x;
     }
-    catch
+    catch (Exception e)
     {
+        Console.Error.WriteLine(e);
     }
 
     var ghosts = new Dictionary<string, (ServerVersion, string)>();
@@ -292,9 +342,10 @@ async Task<Dictionary<string, MSMValidationResult>> Execute(ValidateFolderOpts o
             var outDir = Path.Combine(tmp.Path, "Replays", serverVersion.Version);
             Directory.CreateDirectory(outDir);
             var outPath = Path.Combine(outDir, fileName);
-            if (overrides.ContainsKey(fileName))
+            Console.Error.WriteLine($"Got ghost in {file}");
+            if (overrides.ContainsKey(file))
             {
-                ghost.Validate_ChallengeUid = overrides[fileName];
+                ghost.Validate_ChallengeUid = overrides[file];
                 ghost.Save(outPath);
             }
             else
