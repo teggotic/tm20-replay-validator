@@ -315,10 +315,7 @@ async Task<Dictionary<string, MSMValidationResult>> Execute(ValidateFolderOpts o
         var x = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(Path.Combine(opts.ReplaysFolder, "mappings.json")));
         if (x is not null) overrides = x;
     }
-    catch (Exception e)
-    {
-        Console.Error.WriteLine(e);
-    }
+    catch {}
 
     var ghosts = new Dictionary<string, (ServerVersion, string)>();
     var requiredMaps = new HashSet<string>();
@@ -568,6 +565,7 @@ async Task ProcessStdoutAsync(Dictionary<string, MSMValidationResult> results, S
 
 internal record MSMValidationResult(
     JsonElement? ValidatedResult,
+    JsonElement? DeclaredResult,
     bool? IsValid,
     string? Desc,
     string? FileName,
