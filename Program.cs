@@ -71,6 +71,7 @@ validateMapRecordsCmd.Options.Add(topRecordsCntOpt);
 validateMapRecordsCmd.Options.Add(dockerVolumeOpt);
 validateMapRecordsCmd.Options.Add(additionalMapsStorage);
 validateMapRecordsCmd.Options.Add(prettyJsonOutputOpt);
+validateMapRecordsCmd.Options.Add(verboseStderrOpt);
 validateMapRecordsCmd.Options.Add(reportProgressOpt);
 
 validateMapRecordsCmd.SetAction(async (parseResult, cancellationToken) =>
